@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Instamart AI Image Fraud Detector (Demo)</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: auto;
+            padding-top: 30px;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f3f3f3;
+            border-radius: 8px;
+        }
+        #preview {
+            max-width: 100%;
+            margin-top: 10px;
+        }
+        .score {
+            font-size: 24px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+<h2>Instamart AI Image Fraud Detector</h2>
+<p>Upload a proof image to check if it might be AI-edited or manipulated.</p>
+
+<input id="fileInput" type="file" accept="image/*"/><br>
+<button onclick="analyze()">Analyze</button>
+
+<div id="result"></div>
+
+<script>
+async function analyze() {
+    const fileInput = document.getElementById("fileInput");
+    if (!fileInput.files.length) {
+        alert("Please select an image!");
+        return;
+    }
+
+    const file = fileInput.files[0];
+
+    // Show preview
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        document.getElementById("result").innerHTML = 
+            `<img id="preview" src="${e.target.result}"/><br><br>Analyzing...`;
+    };
+    reader.readAsDataURL(file);
+
+    // Send to backend
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const backendUrl = "YOUR_BACKEND_URL/analyze"; // <- change after deployment
+
+    const res = await fetch(backendUrl, {
+        method: "POST",
+        body: formData
+    });
+
+    const data = await res.json();
+
+    document.getElementById("result").innerHTML = `
+        <h3>Result</h3>
+        <p class="score">Tampering Score: <b>${data.tampering_score}</b></p>
+        <p><b>Recommendation:</b> ${data.recommendation}</p>
+        <p><b>Explanation:</b> ${data.explanation}</p>
+        <pre>${JSON.stringify(data.signals, null, 2)}</pre>
+    `;
+}
+</script>
+
+</body>
+</html>

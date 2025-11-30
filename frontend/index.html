@@ -57,7 +57,7 @@ async function analyze() {
     const formData = new FormData();
     formData.append("file", file);
 
-    const backendUrl = "YOUR_BACKEND_URL/analyze"; // <- change after deployment
+const backendUrl = "https://instamart-image-fraud-detector.onrender.com/analyze";
 
     const res = await fetch(backendUrl, {
         method: "POST",

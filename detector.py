@@ -1,105 +1,162 @@
-from io import BytesIO
-from typing import Dict, Any
-from PIL import Image, ImageChops, ExifTags
+import io
 import numpy as np
+from PIL import Image, ImageChops
+import cv2
 
-SUSPICIOUS_SOFTWARE_KEYWORDS = [
-    "photoshop", "gemini", "stable diffusion", "midjourney", "gimp", "ai"
-]
+# -------------------------
+# Helper: Extract EXIF metadata
+# -------------------------
+def extract_exif(image: Image.Image):
+    try:
+        exif = image.getexif()
+        if not exif or len(exif) == 0:
+            return False, None, None, None, None
+
+        exif_dict = {image.getexif().get_ifd(0).get(tag): val for tag, val in exif.items()}
+        software = exif_dict.get(305) if exif_dict else None   # "Software"
+        dt_original = exif_dict.get(36867) if exif_dict else None
+        dt_digitized = exif_dict.get(36868) if exif_dict else None
+        dt_generic = exif_dict.get(306) if exif_dict else None  # DateTime
+
+        return True, software, dt_original, dt_digitized, dt_generic
+
+    except Exception:
+        return False, None, None, None, None
 
 
-def _get_exif_dict(image: Image.Image) -> Dict[str, Any]:
-    exif_data = getattr(image, "_getexif", lambda: None)()
-    if not exif_data:
-        return {}
+# -------------------------
+# Helper: Error Level Analysis (ELA)
+# -------------------------
+def error_level_analysis(image: Image.Image):
+    ela_temp = io.BytesIO()
+    image.save(ela_temp, "JPEG", quality=95)
+    ela_temp.seek(0)
 
-    exif = {}
-    for tag_id, value in exif_data.items():
-        tag = ExifTags.TAGS.get(tag_id, tag_id)
-        exif[tag] = value
-    return exif
+    recompressed = Image.open(ela_temp)
+    ela = ImageChops.difference(image, recompressed)
 
-
-def _compute_ela_features(image: Image.Image, quality: int = 90):
-    image = image.convert("RGB")
-    buffer = BytesIO()
-    image.save(buffer, "JPEG", quality=quality)
-    buffer.seek(0)
-    resaved = Image.open(buffer).convert("RGB")
-
-    diff = ImageChops.difference(image, resaved)
-    diff_arr = np.asarray(diff).astype("float32")
-
-    intensity = diff_arr.mean(axis=2)
-
-    mean_ela = float(intensity.mean())
-    threshold = 25.0
-    hot_pixels = (intensity > threshold).sum()
-    total_pixels = intensity.size
-    hot_fraction = float(hot_pixels) / float(total_pixels)
+    ela_arr = np.array(ela.convert("L"))
+    mean_ela = float(np.mean(ela_arr))
+    hot_fraction = float(np.mean(ela_arr > 40))
 
     return mean_ela, hot_fraction
 
 
-def analyze_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
-    image = Image.open(BytesIO(image_bytes))
+# -------------------------
+# Helper: High-frequency (texture) analysis
+# AI-regenerated images tend to lack micro-textures.
+# -------------------------
+def high_frequency_score(np_img):
+    gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    return float(laplacian.var())
 
-    exif = _get_exif_dict(image)
-    exif_present = len(exif) > 0
 
-    software_tag = str(exif.get("Software", "")).lower()
-    suspicious_software = any(k in software_tag for k in SUSPICIOUS_SOFTWARE_KEYWORDS)
+# -------------------------
+# Helper: RGB correlation (GAN signature)
+# AI images often have overly correlated color channels.
+# -------------------------
+def rgb_correlation(np_img):
+    r, g, b = np_img[:, :, 0], np_img[:, :, 1], np_img[:, :, 2]
+    corr_rg = np.corrcoef(r.flatten(), g.flatten())[0, 1]
+    corr_gb = np.corrcoef(g.flatten(), b.flatten())[0, 1]
+    corr_rb = np.corrcoef(r.flatten(), b.flatten())[0, 1]
+    return float(corr_rg), float(corr_gb), float(corr_rb)
 
-    dt_original = exif.get("DateTimeOriginal")
-    dt_digitized = exif.get("DateTimeDigitized")
-    dt_generic = exif.get("DateTime")
 
-    mean_ela, hot_fraction = _compute_ela_features(image)
+# -------------------------
+# MAIN FUNCTION
+# -------------------------
+def analyze_image_bytes(image_bytes: bytes):
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    np_img = np.array(image)
 
-    mean_ela_norm = min(mean_ela / 255.0, 1.0)
+    # -------------------------
+    # Extract EXIF
+    # -------------------------
+    exif_present, software_tag, dt_orig, dt_dig, dt_gen = extract_exif(image)
 
+    # -------------------------
+    # ELA
+    # -------------------------
+    mean_ela, hot_fraction = error_level_analysis(image)
+
+    # -------------------------
+    # Texture score
+    # -------------------------
+    hf = high_frequency_score(np_img)
+
+    # -------------------------
+    # Color correlation
+    # -------------------------
+    corr_rg, corr_gb, corr_rb = rgb_correlation(np_img)
+
+    # -------------------------
+    # Scoring logic
+    # -------------------------
     score = 0.0
-    reasons = []
+    explanation_parts = []
 
-    score += 0.4 * mean_ela_norm
-    if mean_ela_norm > 0.15:
-        reasons.append(f"Elevated ELA mean ({mean_ela:.2f}).")
-
-    score += 0.3 * min(hot_fraction * 3.0, 1.0)
-    if hot_fraction > 0.05:
-        reasons.append(f"High ELA hotspot fraction ({hot_fraction:.3f}).")
-
+    # 1. Missing EXIF
     if not exif_present:
-        score += 0.2
-        reasons.append("EXIF metadata missing.")
+        score += 0.25
+        explanation_parts.append("EXIF metadata missing")
 
-    if suspicious_software:
-        score += 0.1
-        reasons.append(f"Editing software detected: '{software_tag}'.")
+    # 2. Software tag suspicious (Photoshop, Snapseed, Gemini, etc.)
+    if software_tag:
+        st = software_tag.lower()
+        if "photoshop" in st or "gemini" in st or "snapseed" in st or "edit" in st:
+            score += 0.3
+            explanation_parts.append(f"Software tag indicates editing: {software_tag}")
 
-    tampering_score = max(0.0, min(score, 1.0))
+    # 3. ELA anomalies (local edits)
+    if mean_ela > 10 or hot_fraction > 0.02:
+        score += 0.35
+        explanation_parts.append("ELA hotspots detected (local edits likely)")
 
-    if tampering_score < 0.3:
+    # 4. High-frequency too LOW (AI regeneration)
+    if hf < 35:
+        score += 0.30
+        explanation_parts.append("Very low high-frequency detail (AI-regenerated image likely)")
+
+    # 5. RGB correlations too high (GAN signature)
+    if corr_rg > 0.985 and corr_gb > 0.985 and corr_rb > 0.985:
+        score += 0.30
+        explanation_parts.append("Abnormally high RGB channel correlation (AI signature)")
+
+    # 6. Strong synthetic indicator: no EXIF + low ELA + low HF
+    if not exif_present and mean_ela < 4 and hf < 35:
+        score = max(score, 0.75)
+        explanation_parts.append("Strong evidence of fully synthetic or AI-modified image")
+
+    # Normalize score
+    score = max(0.0, min(score, 1.0))
+
+    # Labels
+    if score < 0.30:
         recommendation = "auto_approve_ok"
-    elif tampering_score < 0.6:
+    elif score < 0.60:
         recommendation = "low_priority_manual_review"
     else:
         recommendation = "high_priority_manual_review"
 
-    if not reasons:
-        reasons.append("No major tampering signals.")
+    explanation = " | ".join(explanation_parts) if explanation_parts else "No tampering signals detected."
 
     return {
-        "tampering_score": round(tampering_score, 3),
+        "tampering_score": round(score, 3),
         "recommendation": recommendation,
         "signals": {
             "exif_present": exif_present,
-            "software_tag": software_tag or None,
-            "datetime_original": dt_original,
-            "datetime_digitized": dt_digitized,
-            "datetime_generic": dt_generic,
+            "software_tag": software_tag,
+            "datetime_original": dt_orig,
+            "datetime_digitized": dt_dig,
+            "datetime_generic": dt_gen,
             "mean_ela": round(mean_ela, 3),
-            "hot_fraction": round(hot_fraction, 4),
+            "hot_fraction": round(hot_fraction, 3),
+            "high_freq_variance": round(hf, 3),
+            "corr_rg": round(corr_rg, 4),
+            "corr_gb": round(corr_gb, 4),
+            "corr_rb": round(corr_rb, 4),
         },
-        "explanation": " ".join(reasons),
+        "explanation": explanation,
     }
